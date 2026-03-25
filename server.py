@@ -22,7 +22,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hyperliquid-futures-indicator-mcp")
 
-mcp = FastMCP("hyperliquid-futures-indicator-mcp")
+mcp = FastMCP(
+    "hyperliquid-futures-indicator-mcp",
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "8000")),
+)
 
 HYPERLIQUID_KLINES_URL = os.getenv(
     "HYPERLIQUID_KLINES_URL",
@@ -333,5 +337,4 @@ async def retrieve_crypto_indicators(
     }
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http")
