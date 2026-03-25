@@ -1,0 +1,16 @@
+[project]
+name = "hyperliquid-futures-indicator-mcp"
+version = "0.1.0"
+description = "MCP server for Hyperliquid perpetual futures symbol normalization and local indicator computation"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp[cli]>=1.12.0",
+  "httpx>=0.27.0",
+  "python-dotenv>=1.0.1",
+  "pandas>=2.2.2",
+  "numpy>=1.26.4"
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
