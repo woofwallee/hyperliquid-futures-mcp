@@ -34,6 +34,11 @@ HYPERLIQUID_KLINES_URL = os.getenv(
 ).strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
+HYPERLIQUID_INFO_URL = os.getenv(
+    "HYPERLIQUID_INFO_URL",
+    "https://api.hyperliquid.xyz/info",
+).strip()
+
 DEFAULT_COLUMNS = [
     "open", "high", "low", "close", "volume",
     "VWAP", "RSI", "ADX", "ATR", "AO", "Mom", "ROC",
@@ -42,6 +47,8 @@ DEFAULT_COLUMNS = [
     "EMA5", "EMA10", "EMA20", "EMA30", "EMA50", "EMA100", "EMA200",
     "Pivot.Classic.P", "Pivot.Classic.R1", "Pivot.Classic.R2", "Pivot.Classic.R3",
     "Pivot.Classic.S1", "Pivot.Classic.S2", "Pivot.Classic.S3",
+    "MACD.macd", "MACD.signal", "MACD.hist",
+    "BB.upper", "BB.lower", "BB.basis",
 ]
 
 ALIASES = {
@@ -228,6 +235,21 @@ def ichimoku(df: pd.DataFrame):
         "Ichimoku.Lead2": lead2,
     }
 
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal_len: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_len, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return {"MACD.macd": macd_line, "MACD.signal": signal_line, "MACD.hist": histogram}
+
+def bollinger_bands(close: pd.Series, length: int = 20, mult: float = 2.0):
+    basis = close.rolling(length).mean()
+    std = close.rolling(length).std()
+    upper = basis + mult * std
+    lower = basis - mult * std
+    return {"BB.basis": basis, "BB.upper": upper, "BB.lower": lower}
+
 def vwap(df: pd.DataFrame) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3
     return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
@@ -276,6 +298,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out[key] = value
     for key, value in classic_pivots(out).items():
         out[key] = value
+    for key, value in macd(out["close"]).items():
+        out[key] = value
+    for key, value in bollinger_bands(out["close"]).items():
+        out[key] = value
     return out
 
 def latest_values(df: pd.DataFrame, columns: list[str]) -> dict[str, Any]:
@@ -307,6 +333,98 @@ def normalize_hyperliquid_futures_symbols(symbols: list[str]) -> dict[str, Any]:
         "market_type": "futures",
         "normalized": normalized,
         "errors": errors,
+    }
+
+@mcp.tool()
+async def get_hyperliquid_market_data(symbols: list[str]) -> dict[str, Any]:
+    """Fetch live market data from the Hyperliquid API: mark price, oracle price,
+    funding rate, open interest, premium, and 24h volume for one or more symbols."""
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.post(
+            HYPERLIQUID_INFO_URL,
+            json={"type": "metaAndAssetCtxs"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+
+    # payload is [meta, assetCtxs] where meta.universe[i] corresponds to assetCtxs[i]
+    meta = payload[0]
+    asset_ctxs = payload[1]
+    universe = meta.get("universe", [])
+
+    # Build lookup: coin name -> asset context
+    coin_lookup: dict[str, tuple[dict, dict]] = {}
+    for i, asset_info in enumerate(universe):
+        coin_lookup[asset_info["name"].upper()] = (asset_info, asset_ctxs[i])
+
+    results = []
+    errors = []
+    for raw_symbol in symbols:
+        try:
+            canonical = normalize_symbol(raw_symbol)
+            coin = provider_symbol(canonical)
+        except Exception as exc:
+            errors.append({"input": raw_symbol, "error": str(exc)})
+            continue
+
+        entry = coin_lookup.get(coin.upper())
+        if entry is None:
+            errors.append({"input": raw_symbol, "error": f"{coin} not found on Hyperliquid"})
+            continue
+
+        asset_info, ctx = entry
+        mark_price = float(ctx.get("markPx", 0))
+        oracle_price = float(ctx.get("oraclePx", 0))
+        funding_rate = float(ctx.get("funding", 0))
+        open_interest = float(ctx.get("openInterest", 0))
+        day_volume_usd = float(ctx.get("dayNtlVlm", 0))
+        premium = float(ctx.get("premium", 0)) if "premium" in ctx else (
+            (mark_price - oracle_price) / oracle_price if oracle_price else 0.0
+        )
+
+        results.append({
+            "symbol": f"HYPERLIQUID:{coin.upper()}",
+            "mark_price": mark_price,
+            "oracle_price": oracle_price,
+            "funding_rate": funding_rate,
+            "funding_rate_annualized": round(funding_rate * 3 * 365, 6),
+            "open_interest": open_interest,
+            "open_interest_usd": round(open_interest * mark_price, 2),
+            "premium": round(premium, 8),
+            "day_volume_usd": round(day_volume_usd, 2),
+        })
+
+    return {
+        "exchange": "HYPERLIQUID",
+        "market_type": "futures",
+        "results": results,
+        "errors": errors,
+    }
+
+@mcp.tool()
+async def retrieve_crypto_indicators_mtf(
+    ticker: str,
+    timeframes: list[str],
+    columns: list[str] | None = None,
+    limit: int = 300,
+) -> dict[str, Any]:
+    """Multi-timeframe indicator retrieval. Fetches indicators for a single ticker
+    across multiple timeframes in one call."""
+    requested = columns or DEFAULT_COLUMNS
+    canonical = normalize_symbol(ticker)
+
+    tf_results: dict[str, dict[str, Any]] = {}
+    for tf in timeframes:
+        candles = await fetch_klines(canonical, tf, limit=limit)
+        enriched = compute_indicators(candles)
+        tf_results[tf] = latest_values(enriched, requested)
+
+    return {
+        "exchange": "HYPERLIQUID",
+        "market_type": "futures",
+        "results": {
+            canonical: tf_results,
+        },
     }
 
 @mcp.tool()
